@@ -1,0 +1,43 @@
+{
+  "name": "@mailovo/engine",
+  "version": "0.1.0",
+  "description": "Move IMAP mailboxes: resumable, without duplicates, never touching the old mailbox. The copy engine behind Mailovo.",
+  "type": "module",
+  "private": true,
+  "license": "MIT",
+  "author": "Maurice Schade (Mailovo)",
+  "homepage": "https://github.com/mailovo/engine#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/mailovo/engine.git"
+  },
+  "bugs": "https://github.com/mailovo/engine/issues",
+  "exports": "./index.ts",
+  "files": [
+    "index.ts",
+    "src",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "test": "node --test test/*.test.ts",
+    "check": "tsc --noEmit"
+  },
+  "dependencies": {
+    "imapflow": "^2.0.6"
+  },
+  "devDependencies": {
+    "@types/node": "^24.13.6",
+    "typescript": "^7.0.2"
+  },
+  "keywords": [
+    "imap",
+    "email",
+    "migration",
+    "mailbox",
+    "imapflow"
+  ]
+}
