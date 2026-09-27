@@ -4,7 +4,7 @@
 // dann werden nur Mails kopiert, die seit dem letzten Lauf neu sind.
 // Im alten Postfach wird nie etwas verändert (nur lesend).
 import { MailovoError, type ErrorCode } from '../errors.ts';
-import { dedupeKey, type MailStore, type MessageMeta } from '../mail/store.ts';
+import { dedupeKey, type MailStore, type MessageMeta, type ReadableMailStore } from '../mail/store.ts';
 import { planFolders, type FolderPlan, type PlanOptions } from './plan.ts';
 
 export interface FolderState {
@@ -22,6 +22,8 @@ export interface FolderState {
   tooBig: number;
   /** Mails, die im alten Postfach gelöscht wurden, während wir kopiert haben */
   vanished?: number;
+  /** Mails, die sich nicht lesen oder ablegen ließen; sie bleiben im alten Postfach (unreadable im Bericht) */
+  failed?: number;
   bytes: number;
   done: boolean;
   /** Zielordner ist angelegt (nicht erneut anlegen) */
@@ -36,6 +38,8 @@ export interface MigrationState {
   window?: { startedAt: string; downloaded: number; uploaded: number };
   /** Zu große Mails für den Bericht */
   skipped: { folder: string; subject?: string; size: number; date?: string }[];
+  /** Einzelne Mails, die der alte Anbieter nicht herausgab oder der neue ablehnte (Bericht, Fertig-Mail) */
+  unreadable?: { folder: string; subject?: string; size: number; date?: string; code: string }[];
   /** Ordner, die nicht gelesen oder angelegt werden konnten (Rest läuft weiter) */
   failedFolders?: { folder: string; code: string }[];
   /** Anzahl abgeschlossener Läufe; ab dem zweiten ist es Nachsendung */
@@ -66,6 +70,8 @@ export interface MigrationOptions extends PlanOptions {
   targetLimits?: { dailyUploadBytes?: number };
   /** Neu gezählte Mails je Ordner melden, z. B. für Auswertungen außerhalb der Engine */
   observe?: Observer;
+  /** Pause vor dem zweiten Leseversuch einer Mail (Tests: 0) */
+  retryDelayMs?: number;
 }
 
 /**
@@ -103,14 +109,31 @@ export function totalsOf(state: MigrationState) {
     duplicates: sum('duplicates'),
     tooBig: sum('tooBig'),
     vanished: sum('vanished'),
+    failed: sum('failed'),
     bytesDone: sum('bytes'),
-    processed: sum('copied') + sum('duplicates') + sum('tooBig') + sum('vanished'),
+    processed: sum('copied') + sum('duplicates') + sum('tooBig') + sum('vanished') + sum('failed'),
     synced: state.synced ?? 0,
   };
 }
 
+/**
+ * Was nach dem Umzug nur im alten Postfach liegt: Ordner, die sich nicht lesen oder anlegen ließen, zu große Mails
+ * und Mails, die sich nicht übertragen ließen. Bei Lücken sagt die Fertig-Mail das deutlich, bevor jemand das alte
+ * Postfach kündigt. (Im alten Postfach gelöschte Mails sind keine Lücke.)
+ */
+export function gapsOf(state: MigrationState | null | undefined) {
+  const t = state ? totalsOf(state) : null;
+  const gaps = { folders: (state?.failedFolders ?? []).map((f) => f.folder), tooBig: t?.tooBig ?? 0, failed: t?.failed ?? 0 };
+  return { ...gaps, any: gaps.folders.length > 0 || gaps.tooBig > 0 || gaps.failed > 0 };
+}
+
 const DAY = 24 * 60 * 60 * 1000;
 const CHECKPOINT_EVERY = 20;
+/**
+ * So viele Mails nacheinander, die sich nicht übertragen lassen, deuten auf ein grundsätzliches Problem (Server
+ * gestört, Verbindung kaputt). Dann wird nichts übersprungen, sondern der ganze Auftrag später wiederholt.
+ */
+export const MAX_FAILED_STREAK = 5;
 
 /** Ausgehende und aussortierte Ordner sagen nichts darüber, wo die Adresse hinterlegt ist. */
 const NOT_INBOUND = new Set(['sent', 'drafts', 'trash', 'junk']);
@@ -132,7 +155,7 @@ function markFailed(state: MigrationState, folder: string, err: MailovoError) {
  * die der Auftrag behandeln muss (Netz, Limit, Speicher voll, Passwort geändert).
  */
 export async function migrate(
-  source: MailStore,
+  source: ReadableMailStore,
   target: MailStore,
   state: MigrationState,
   opts: MigrationOptions,
@@ -153,9 +176,12 @@ export async function migrate(
       listed = await source.withFolder(p.source, async (f) => {
         const uv = f.uidValidity();
         if (known?.uidValidity && uv && known.uidValidity !== uv) {
-          // Ordner wurde auf dem Server neu angelegt: alles neu abgleichen, Duplikate fängt der Abgleich ab
+          // Ordner wurde auf dem Server neu angelegt: alles neu abgleichen, Duplikate fängt der Abgleich ab.
+          // Gemerkte UIDs aus "Aktuelles zuerst" gelten nicht mehr, sonst würden neu vergebene UIDs übersprungen.
           known.lastUid = 0;
           known.maxUid = 0;
+          known.early = undefined;
+          known.done = false;
         }
         return { uv, items: await f.messages({ since: opts.since, minUid: known ? known.lastUid + 1 : 1 }) };
       });
@@ -222,25 +248,74 @@ export async function migrate(
     }
   }
 
-  /** Nachrichten eines Ordners kopieren; early: Durchgang "Aktuelles zuerst" (UIDs merken, lastUid nicht verändern) */
+  /** Fehlschläge nacheinander, über Ordner hinweg (siehe MAX_FAILED_STREAK) */
+  let streak = 0;
+  /** In diesem Lauf kopierte Mails je Zielordner und Schlüssel mit Größe: verschiedene Mails mit derselben Message-ID kommen beide an */
+  const copiedNow = new Map<string, Map<string, Set<number>>>();
+  const pause = (ms: number) => (ms > 0 ? new Promise((r) => setTimeout(r, ms)) : Promise.resolve());
+
+  /**
+   * Nachrichten eines Ordners kopieren; early: Durchgang "Aktuelles zuerst" (UIDs merken, lastUid nicht verändern).
+   * Lässt sich eine einzelne Mail nicht lesen oder ablegen, bleibt sie im alten Postfach und steht im Bericht; der Rest
+   * läuft weiter. Im Durchgang "Aktuelles zuerst" wird sie nur übergangen und im zweiten Durchgang noch einmal versucht.
+   */
   async function copyList(p: FolderPlan, fs: FolderState, existing: Set<string>, list: MessageMeta[], early: boolean) {
     let sinceCheckpoint = 0;
     const skip = new Set(fs.early ?? []);
+    if (!copiedNow.has(fs.target)) copiedNow.set(fs.target, new Map());
+    const copied = copiedNow.get(fs.target)!;
+    /** Fehlschläge seit dem letzten Erfolg; festgehalten erst, wenn danach wieder etwas klappt oder der Ordner endet */
+    let pending: { meta: MessageMeta; code: string }[] = [];
+    const commit = () => {
+      if (!early) {
+        for (const { meta, code } of pending) {
+          fs.failed = (fs.failed ?? 0) + 1;
+          (state.unreadable ??= []).push({ folder: p.source, subject: meta.subject, size: meta.size, date: meta.internalDate?.toISOString(), code });
+          fs.lastUid = Math.max(fs.lastUid, meta.uid);
+        }
+      }
+      pending = [];
+    };
+    /** Etwas hat geklappt: vorherige Fehlschläge waren Einzelfälle */
+    const ok = () => {
+      commit();
+      streak = 0;
+    };
+    const fail = (meta: MessageMeta, err: MailovoError) => {
+      pending.push({ meta, code: err.code });
+      // Grundsätzliches Problem: nichts festhalten, der Auftrag beginnt später wieder vor diesen Mails
+      if (++streak >= MAX_FAILED_STREAK) throw err;
+    };
     await source.withFolder(p.source, async (folder) => {
       for (const meta of list) {
         if (hooks.shouldStop?.()) return;
         if (!skip.has(meta.uid)) {
           enforceLimits(state, meta.size, opts, now());
           const key = dedupeKey(meta);
-          if (key && existing.has(key)) {
+          const seen = key ? copied.get(key) : undefined;
+          if (key && (seen ? seen.has(meta.size) : existing.has(key))) {
             fs.duplicates++;
           } else {
-            let content: Buffer;
-            try {
-              content = await folder.download(meta.uid);
-            } catch (err) {
-              // Inzwischen im alten Postfach gelöscht: überspringen statt den ganzen Umzug abzubrechen
-              if (!(err instanceof MailovoError) || err.code !== 'DATA-04') throw err;
+            let content: Buffer | undefined;
+            let failed = false;
+            for (let attempt = 1; !content && !failed; attempt++) {
+              try {
+                content = await folder.download(meta.uid);
+              } catch (err) {
+                // Inzwischen im alten Postfach gelöscht: überspringen statt den ganzen Umzug abzubrechen
+                if (err instanceof MailovoError && err.code === 'DATA-04') break;
+                if (!isFolderLevel(err)) throw err;
+                // Lesen ändert nichts: einmal kurz warten und noch einmal versuchen
+                if (attempt < 2) await pause(opts.retryDelayMs ?? 1500);
+                else {
+                  fail(meta, err);
+                  failed = true;
+                }
+              }
+            }
+            if (failed) continue;
+            if (!content) {
+              ok();
               fs.vanished = (fs.vanished ?? 0) + 1;
               if (early) (fs.early ??= []).push(meta.uid);
               if (!early) fs.lastUid = meta.uid;
@@ -253,22 +328,35 @@ export async function migrate(
               countWindow(state, 'uploaded', content.length, now());
               fs.copied++;
               fs.bytes += content.length;
-              if (key) existing.add(key);
+              if (key) {
+                existing.add(key);
+                if (!copied.has(key)) copied.set(key, new Set());
+                copied.get(key)!.add(meta.size);
+              }
             } catch (err) {
-              if (!(err instanceof MailovoError) || err.code !== 'DATA-02') throw err;
-              fs.tooBig++;
-              state.skipped.push({ folder: p.source, subject: meta.subject, size: meta.size, date: meta.internalDate?.toISOString() });
+              if (err instanceof MailovoError && err.code === 'DATA-02') {
+                fs.tooBig++;
+                state.skipped.push({ folder: p.source, subject: meta.subject, size: meta.size, date: meta.internalDate?.toISOString() });
+              } else {
+                // Vom neuen Postfach abgelehnt (z. B. beschädigte Kopfzeilen); nicht sofort wiederholen, sonst droht eine Dublette
+                if (!isFolderLevel(err)) throw err;
+                fail(meta, err);
+                continue;
+              }
             }
           }
+          ok();
           if (early) (fs.early ??= []).push(meta.uid);
         }
-        if (!early) fs.lastUid = meta.uid;
+        if (!early && !pending.length) fs.lastUid = meta.uid;
         await hooks.onProgress?.(state);
         if (++sinceCheckpoint >= CHECKPOINT_EVERY) {
           sinceCheckpoint = 0;
           await hooks.checkpoint?.(state);
         }
       }
+      // Ordnerende: Fehlschläge festhalten (der Zähler läuft weiter, ein grundsätzliches Problem zeigt sich auch über Ordner hinweg)
+      commit();
     });
   }
 

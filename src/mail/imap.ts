@@ -143,13 +143,14 @@ export class ImapStore implements MailStore {
         const keys = new Set<string>();
         try {
           if (!client.mailbox || client.mailbox.exists === 0) return keys;
-          for await (const m of client.fetch('1:*', { uid: true, envelope: true, internalDate: true, headers: ['subject'] })) {
+          for await (const m of client.fetch('1:*', { uid: true, envelope: true, internalDate: true, size: true, headers: ['subject'] })) {
             const key = dedupeKey({
               messageId: normalizeMessageId(m.envelope?.messageId),
               from: m.envelope?.from?.[0]?.address,
               // gleich dekodiert wie in messages(), sonst passt der Fingerabdruck nicht zusammen
               subject: repairHeader(m.envelope?.subject, m.headers && rawHeader(m.headers, 'subject')),
               internalDate: m.internalDate ? new Date(m.internalDate) : undefined,
+              size: m.size,
             });
             if (key) keys.add(key);
           }
@@ -185,8 +186,24 @@ export class ImapStore implements MailStore {
       async download(uid) {
         try {
           const m = await client.fetchOne(String(uid), { uid: true, source: true }, { uid: true });
-          if (!m || !m.source) throw Object.assign(new Error('message vanished'), { code: 'EMISSING' });
-          return m.source;
+          if (m && m.source) return m.source;
+          // Nur "gelöscht", wenn es die UID wirklich nicht mehr gibt; sonst gibt der Server die Mail nicht heraus
+          const still = await client.search({ uid: String(uid) }, { uid: true });
+          if (still && still.includes(uid)) throw Object.assign(new Error(`message ${uid} has no content`), { code: 'EUNREADABLE' });
+          throw Object.assign(new Error('message vanished'), { code: 'EMISSING' });
+        } catch (err) {
+          throw toError(err, 'read');
+        }
+      },
+      async newest(n) {
+        try {
+          const exists = client.mailbox ? client.mailbox.exists : 0;
+          if (!exists) return [];
+          const out: { uid: number; messageId?: string }[] = [];
+          for await (const m of client.fetch(`${Math.max(1, exists - n + 1)}:*`, { uid: true, envelope: true })) {
+            out.push({ uid: m.uid, messageId: normalizeMessageId(m.envelope?.messageId) });
+          }
+          return out.sort((a, b) => a.uid - b.uid).slice(-n);
         } catch (err) {
           throw toError(err, 'read');
         }

@@ -2,7 +2,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { MailovoError } from '../src/errors.ts';
-import { migrate, emptyState, totalsOf } from '../src/engine/migrate.ts';
+import { migrate, emptyState, gapsOf, MAX_FAILED_STREAK, totalsOf } from '../src/engine/migrate.ts';
 import { planFolders } from '../src/engine/plan.ts';
 import { MemoryStore, makeMessage } from '../src/mail/memory.ts';
 
@@ -219,4 +219,143 @@ test('Umzug: Netzfehler bleiben Fehler des ganzen Auftrags (kein stilles Übersp
   src.add('INBOX', makeMessage({ id: 'a@x' }));
   src.withFolder = () => Promise.reject(new MailovoError('NET-01', { retryable: true }));
   await assert.rejects(migrate(src, gmailLike(), emptyState(), { includeTrash: false, includeJunk: false }), (e: MailovoError) => e.code === 'NET-01');
+});
+
+test('Umzug: eine unlesbare Mail bleibt im alten Postfach und steht im Bericht, der Rest läuft weiter', async () => {
+  const src = gmxLike();
+  for (const id of ['a@x', 'kaputt@x', 'c@x']) src.add('INBOX', makeMessage({ id, subject: id }));
+  src.add('Rechnungen', makeMessage({ id: 'r@x' }));
+  let tries = 0;
+  src.beforeDownload = (_path, uid) => {
+    if (uid === 2 && _path === 'INBOX') {
+      tries++;
+      throw new MailovoError('INT-01', { detail: 'NO Server error' });
+    }
+  };
+  const dst = gmailLike();
+  const state = emptyState();
+  assert.equal(await migrate(src, dst, state, { includeTrash: false, includeJunk: false, retryDelayMs: 0 }), 'done');
+  assert.equal(tries, 2, 'Lesen wird einmal wiederholt');
+  assert.equal(dst.folders.get('INBOX')!.messages.length, 2);
+  assert.equal(dst.folders.get('Rechnungen')!.messages.length, 1);
+  const t = totalsOf(state);
+  assert.deepEqual([t.copied, t.failed, t.processed, t.messages], [3, 1, 4, 4]);
+  assert.deepEqual(state.unreadable, [{ folder: 'INBOX', subject: 'kaputt@x', size: state.unreadable![0]!.size, date: undefined, code: 'INT-01' }]);
+  assert.equal(gapsOf(state).any, true);
+
+  // Nachsendung: die unlesbare Mail wird nicht bei jedem Lauf wieder versucht und nicht doppelt gezählt
+  src.beforeDownload = undefined;
+  await migrate(src, dst, state, { includeTrash: false, includeJunk: false, retryDelayMs: 0 });
+  assert.equal(totalsOf(state).failed, 1);
+});
+
+test('Umzug: vom neuen Postfach abgelehnte Mail wird nicht wiederholt (keine Dublette), aber gemeldet', async () => {
+  const src = gmxLike();
+  for (const id of ['a@x', 'b@x', 'c@x']) src.add('INBOX', makeMessage({ id }));
+  const dst = gmailLike();
+  let rejected = 0;
+  dst.beforeAppend = (_path, content) => {
+    if (content.includes('b@x')) {
+      rejected++;
+      throw new MailovoError('INT-01', { detail: 'NO [CANNOT] Invalid message' });
+    }
+  };
+  const state = emptyState();
+  assert.equal(await migrate(src, dst, state, { includeTrash: false, includeJunk: false, retryDelayMs: 0 }), 'done');
+  assert.equal(rejected, 1);
+  assert.deepEqual(
+    dst.folders.get('INBOX')!.messages.map((m) => m.uid),
+    [1, 2],
+  );
+  assert.deepEqual([totalsOf(state).copied, totalsOf(state).failed], [2, 1]);
+});
+
+test('Umzug: viele Fehlschläge nacheinander = grundsätzliches Problem, nichts wird übersprungen', async () => {
+  const src = gmxLike();
+  for (let i = 0; i < 8; i++) src.add('INBOX', makeMessage({ id: `m${i}@x` }));
+  let broken = true;
+  src.beforeDownload = (_path, uid) => {
+    if (broken && uid >= 2) throw new MailovoError('INT-01', { detail: 'Server gestört' });
+  };
+  const dst = gmailLike();
+  const state = emptyState();
+  await assert.rejects(migrate(src, dst, state, { includeTrash: false, includeJunk: false, retryDelayMs: 0 }), (e: MailovoError) => e.code === 'INT-01');
+  assert.equal(MAX_FAILED_STREAK, 5);
+  assert.equal(totalsOf(state).failed, 0, 'nichts als unlesbar festgehalten');
+  assert.equal(state.unreadable, undefined);
+  assert.equal(state.folders.INBOX!.lastUid, 1, 'Fortsetzung beginnt vor den Fehlschlägen');
+
+  broken = false;
+  const resumed = JSON.parse(JSON.stringify(state));
+  assert.equal(await migrate(src, dst, resumed, { includeTrash: false, includeJunk: false, retryDelayMs: 0 }), 'done');
+  assert.equal(dst.folders.get('INBOX')!.messages.length, 8);
+  assert.equal(totalsOf(resumed).failed, 0);
+});
+
+test('Umzug: "Aktuelles zuerst" überspringt eine unlesbare Mail nur vorläufig, der zweite Durchgang versucht sie erneut', async () => {
+  const now = new Date('2026-09-20T12:00:00Z');
+  const src = gmxLike();
+  src.add('INBOX', makeMessage({ id: 'alt@x' }), [], new Date('2024-01-01'));
+  src.add('INBOX', makeMessage({ id: 'neu@x' }), [], new Date('2026-09-19'));
+  let fails = 2;
+  src.beforeDownload = (_path, uid) => {
+    if (uid === 2 && fails-- > 0) throw new MailovoError('INT-01');
+  };
+  const dst = gmailLike();
+  const state = emptyState();
+  await migrate(src, dst, state, { includeTrash: false, includeJunk: false, retryDelayMs: 0 }, { now: () => now });
+  assert.equal(dst.folders.get('INBOX')!.messages.length, 2);
+  assert.deepEqual([totalsOf(state).copied, totalsOf(state).failed], [2, 0]);
+});
+
+test('Umzug: neue UIDVALIDITY nach "Aktuelles zuerst": alte gemerkte UIDs überspringen keine Mails', async () => {
+  const now = new Date('2026-09-20T12:00:00Z');
+  const src = gmxLike();
+  src.add('INBOX', makeMessage({ id: 'A@x' }), [], new Date('2024-01-01'));
+  src.add('INBOX', makeMessage({ id: 'B@x' }), [], new Date('2024-02-01'));
+  src.add('INBOX', makeMessage({ id: 'C@x' }), [], new Date('2026-09-18'));
+  src.add('INBOX', makeMessage({ id: 'D@x' }), [], new Date('2026-09-19'));
+  const dst = gmailLike();
+  const state = emptyState();
+  // Nach "Aktuelles zuerst" (C, D) anhalten
+  let copied = 0;
+  await migrate(src, dst, state, { includeTrash: false, includeJunk: false }, { now: () => now, onProgress: () => void copied++, shouldStop: () => copied >= 2 });
+  assert.deepEqual(state.folders.INBOX!.early, [4, 3]);
+  // Der Anbieter legt den Ordner neu an: gleiche Mails, neue UIDs in anderer Reihenfolge
+  const f = src.folders.get('INBOX')!;
+  f.uidValidity = '2';
+  f.messages = [f.messages[3]!, f.messages[2]!, f.messages[1]!, f.messages[0]!].map((m, i) => ({ ...m, uid: i + 1 }));
+  f.nextUid = 5;
+  assert.equal(await migrate(src, dst, state, { includeTrash: false, includeJunk: false }, { now: () => now }), 'done');
+  const ids = dst.folders.get('INBOX')!.messages.map((m) => /Message-ID: <([^>]+)>/.exec(m.content.toString())![1]).sort();
+  assert.deepEqual(ids, ['A@x', 'B@x', 'C@x', 'D@x']);
+});
+
+test('Duplikat-Abgleich: verschiedene Mails mit gleichem Absender, Betreff und Zeitpunkt kommen alle an', async () => {
+  const at = new Date('2026-05-01T08:00:00Z');
+  const src = gmxLike();
+  src.add('INBOX', makeMessage({ subject: 'Alarm', body: 'Sensor 1' }), [], at);
+  src.add('INBOX', makeMessage({ subject: 'Alarm', body: 'Sensor 12' }), [], at);
+  src.add('INBOX', makeMessage({ subject: 'Alarm', body: 'Sensor 123' }), [], at);
+  const dst = gmailLike();
+  const state = emptyState();
+  await migrate(src, dst, state, { includeTrash: false, includeJunk: false, recentFirst: false });
+  assert.equal(dst.folders.get('INBOX')!.messages.length, 3);
+  assert.equal(totalsOf(state).duplicates, 0);
+  // Fortsetzen erkennt die kopierten trotzdem als vorhanden
+  const again = emptyState();
+  await migrate(src, dst, again, { includeTrash: false, includeJunk: false, recentFirst: false });
+  assert.equal(dst.folders.get('INBOX')!.messages.length, 3);
+});
+
+test('Duplikat-Abgleich: zwei verschiedene Mails mit derselben Message-ID in einem Lauf kommen beide an', async () => {
+  const src = gmxLike();
+  src.add('INBOX', makeMessage({ id: 'gleich@x', body: 'erste' }));
+  src.add('INBOX', makeMessage({ id: 'gleich@x', body: 'zweite, andere Mail' }));
+  src.add('INBOX', makeMessage({ id: 'gleich@x', body: 'erste' }));
+  const dst = gmailLike();
+  const state = emptyState();
+  await migrate(src, dst, state, { includeTrash: false, includeJunk: false });
+  assert.equal(dst.folders.get('INBOX')!.messages.length, 2, 'echte Dublette (gleich groß) nur einmal');
+  assert.equal(totalsOf(state).duplicates, 1);
 });

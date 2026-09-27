@@ -8,7 +8,7 @@ import { MemoryStore, makeMessage } from '../src/mail/memory.ts';
 import type { FolderHandle, MailStore } from '../src/mail/store.ts';
 
 /** Alle erlaubten Zugriffe auf das alte Postfach: Ordner auflisten, Ordner lesend öffnen, Mails lesen */
-const READ_ONLY = new Set(['listFolders', 'withFolder', 'folder.messages', 'folder.uidValidity', 'folder.download', 'folder.dedupeKeys', 'folder.totalSize']);
+const READ_ONLY = new Set(['listFolders', 'withFolder', 'folder.messages', 'folder.uidValidity', 'folder.download', 'folder.dedupeKeys', 'folder.totalSize', 'folder.newest']);
 
 /** Postfach, das jeden Aufruf mitschreibt, auch an geöffneten Ordnern */
 function recorded(store: MailStore) {

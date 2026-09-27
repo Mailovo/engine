@@ -13,11 +13,12 @@ happens to their emails during a move.
   then refuses any change. Emails are also fetched with `BODY.PEEK`, which doesn't set the “read” mark either.
 - **There is no command to delete, move or re-flag.** The mailbox interface in
   [`src/mail/store.ts`](src/mail/store.ts) only knows: list folders, read emails, create a folder, add an email.
+  `migrate` even receives the old mailbox as a `ReadableMailStore`, a type without `createFolder` and `append`.
 - **Only the new mailbox is written to.** [`src/engine/migrate.ts`](src/engine/migrate.ts) calls `createFolder` and
   `append` on the target only.
 - **Contents are copied 1:1.** An email is downloaded and added to the new mailbox unchanged, never parsed and never
   stored. The saved state only holds counts, message numbers (UIDs), dates and folder names, plus subject, size and
-  date of emails too large for the new mailbox (for the report).
+  date of emails that are too large for the new mailbox or could not be transferred (for the report).
 - **Which headers are read, and why.** Message-ID, sender, subject and date, to recognise emails that are already in
   the new mailbox. Recipients, sender name and `List-Unsubscribe` are only handed to the caller (`observe`) for optional
   analyses of the Mailovo service; the engine keeps none of them.
@@ -35,8 +36,8 @@ happens to their emails during a move.
   `[Google Mail]`, servers with an `INBOX.` prefix. Your own folders keep their names and hierarchy. Gmail's virtual
   folders (All Mail, Starred, Important) are skipped, so nothing arrives twice.
 - **Copies message by message** with the original date and flags (seen, answered, flagged, draft, custom keywords).
-- **Never duplicates.** Messages already in the target (by Message-ID, otherwise sender, subject and date) are
-  skipped, also when a move is repeated.
+- **Never duplicates.** Messages already in the target (by Message-ID, otherwise sender, subject, date and size) are
+  skipped, also when a move is repeated. When in doubt it rather copies twice than leave an email behind.
 - **Resumes.** The state is a plain JSON object, saved every 20 messages. After an interruption the move continues
   where it stopped. A changed UIDVALIDITY is detected.
 - **Recent first.** Emails of the last 30 days arrive before older ones, so the new mailbox is usable right away.
@@ -45,7 +46,11 @@ happens to their emails during a move.
   instead of failing the whole move.
 - **Only reads the old mailbox.** Nothing is deleted, moved or flagged there.
 - **Explains errors.** Codes such as `AUTH-01` (wrong password), `AUTH-02` (app password needed), `CAP-02` (target
-  full), `RATE-01` (daily limit) or `NET-01` (connection lost). Problems with a single folder don't stop the move.
+  full), `RATE-01` (daily limit) or `NET-01` (connection lost).
+- **Says what stayed behind.** A folder that can't be read or an email the old provider won't hand over (read twice)
+  or the new one rejects doesn't stop the move. It is listed in the state (`failedFolders`, `unreadable`), and
+  `gapsOf(state)` tells you whether anything is left only in the old mailbox, before anyone closes it. Five failures in
+  a row count as a real problem: the run stops without skipping anything and can simply be repeated.
 - **Guards the network.** Connections only to public addresses on the IMAP ports 993 and 143, pinned to the checked
   address (no DNS rebinding).
 
@@ -125,7 +130,8 @@ mit den E-Mails passiert.
   Mailserver selbst lässt dann keine Änderung zu. Zusätzlich werden Mails mit `BODY.PEEK` abgerufen, das setzt auch
   die Markierung „gelesen“ nicht.
 - Die Schnittstelle zum Postfach (`src/mail/store.ts`) kennt gar keinen Befehl zum Löschen, Verschieben oder
-  Umflaggen. Geschrieben wird nur ins neue Postfach: Ordner anlegen, Mail hinzufügen.
+  Umflaggen. Geschrieben wird nur ins neue Postfach: Ordner anlegen, Mail hinzufügen. `migrate` bekommt das alte
+  Postfach sogar als `ReadableMailStore`, einen Typ ganz ohne `createFolder` und `append`.
 - Der Inhalt einer Mail wird unverändert übertragen, nie ausgewertet und nie gespeichert.
 - Außer den beiden IMAP-Verbindungen baut der Code keine Verbindungen auf, schreibt keine Dateien und startet keine
   Programme.
@@ -136,7 +142,8 @@ mit den E-Mails passiert.
 Enthalten sind die Ordnerzuordnung (Standardordner landen im Gegenstück des neuen Anbieters, eigene Ordner behalten
 Namen und Aufbau), das Kopieren mit Datum und Markierungen, der Abgleich gegen Doppelte, das Fortsetzen nach einer
 Unterbrechung, „Aktuelles zuerst“, die Nachsendung, Anbieterlimits, verständliche Fehlercodes und der Schutz vor
-Verbindungen ins interne Netz. Das alte Postfach wird nur gelesen.
+Verbindungen ins interne Netz. Das alte Postfach wird nur gelesen. Lässt sich ein Ordner oder eine einzelne Mail nicht
+übertragen, läuft der Rest weiter; `gapsOf(state)` sagt, was nur im alten Postfach geblieben ist.
 
 Nicht enthalten ist alles rund um den Dienst: Website, Adress-Checkliste, Newsletter- und Kontaktlisten, Kontakte und
 Kalender, Helferbot, Konten, Abrechnung, Benachrichtigungen und die Anmeldung bei Microsoft.

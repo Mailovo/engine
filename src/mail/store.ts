@@ -61,6 +61,8 @@ export interface FolderHandle {
   download(uid: number): Promise<Buffer>;
   /** Summe der Nachrichtengrößen in Bytes, optional ab Datum (für die Zusammenfassung vor dem Start). */
   totalSize(opts?: { since?: Date }): Promise<{ messages: number; bytes: number }>;
+  /** UID und Message-ID der n neuesten Nachrichten, aufsteigend nach UID (erkennt "altes und neues Postfach sind dasselbe") */
+  newest(n: number): Promise<{ uid: number; messageId?: string }[]>;
 }
 
 export interface MailStore {
@@ -73,6 +75,12 @@ export interface MailStore {
   close(): Promise<void>;
 }
 
+/**
+ * So sieht die Engine das alte Postfach: nur Ordner auflisten und lesend öffnen. Anlegen und Ablegen gibt es hier gar
+ * nicht, schon der Typ verhindert also, dass je etwas ins alte Postfach geschrieben wird.
+ */
+export type ReadableMailStore = Pick<MailStore, 'listFolders' | 'withFolder' | 'close'>;
+
 export function normalizeMessageId(id: string | undefined | null): string | undefined {
   const v = id?.trim().replace(/^<|>$/g, '').toLowerCase();
   return v ? v : undefined;
@@ -80,12 +88,13 @@ export function normalizeMessageId(id: string | undefined | null): string | unde
 
 /**
  * Schlüssel, an dem dieselbe Mail in beiden Postfächern erkannt wird: die Message-ID, und wo sie
- * fehlt ein Fingerabdruck aus Absender, Betreff und Eingangsdatum.
+ * fehlt ein Fingerabdruck aus Absender, Betreff, Eingangsdatum und Größe. Im Zweifel lieber eine Dublette
+ * als eine Mail, die fälschlich als "schon vorhanden" im alten Postfach bleibt.
  */
-export function dedupeKey(m: { messageId?: string; from?: string; subject?: string; internalDate?: Date }): string | undefined {
+export function dedupeKey(m: { messageId?: string; from?: string; subject?: string; internalDate?: Date; size?: number }): string | undefined {
   if (m.messageId) return m.messageId;
   if (!m.internalDate || Number.isNaN(m.internalDate.getTime())) return undefined;
   const from = (m.from ?? '').trim().toLowerCase();
   const subject = (m.subject ?? '').replace(/\s+/g, ' ').trim().toLowerCase();
-  return `fp:${from}|${subject}|${Math.floor(m.internalDate.getTime() / 1000)}`;
+  return `fp:${from}|${subject}|${Math.floor(m.internalDate.getTime() / 1000)}|${m.size ?? ''}`;
 }

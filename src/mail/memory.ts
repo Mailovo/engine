@@ -151,6 +151,7 @@ export class MemoryStore implements MailStore {
             from: /<([^>]+)>|(\S+@\S+)/.exec(header(m.content, 'From') ?? '')?.slice(1).find(Boolean),
             subject: header(m.content, 'Subject'),
             internalDate: m.date,
+            size: m.content.length,
           }),
         );
         return new Set(keys.filter((x): x is string => !!x));
@@ -161,6 +162,9 @@ export class MemoryStore implements MailStore {
       async totalSize(opts = {}) {
         const list = f.messages.filter((m) => !opts.since || (m.date ?? new Date(0)) >= opts.since);
         return { messages: list.length, bytes: list.reduce((n, m) => n + m.content.length, 0) };
+      },
+      async newest(n) {
+        return f.messages.slice(-n).map((m) => ({ uid: m.uid, messageId: normalizeMessageId(header(m.content, 'Message-ID')) }));
       },
       async download(uid) {
         self.beforeDownload?.(path, uid);

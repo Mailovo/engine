@@ -8,7 +8,9 @@ export {
   totalsOf,
   capFor,
   isFolderLevel,
+  gapsOf,
   RECENT_DAYS,
+  MAX_FAILED_STREAK,
   type MigrationState,
   type MigrationOptions,
   type MigrationHooks,
@@ -22,7 +24,7 @@ export { planFolders, type FolderPlan, type PlanOptions } from './src/engine/pla
 export { folderRole, guessLanguage, DEFAULT_NAMES, VIRTUAL_ROLES, type Role, type RoleInfo } from './src/engine/roles.ts';
 
 // Postfach-Schnittstelle und Umsetzungen
-export type { MailStore, FolderHandle, MessageMeta, StoreFolder, Quota, AuthKind, ImapSettings } from './src/mail/store.ts';
+export type { MailStore, ReadableMailStore, FolderHandle, MessageMeta, StoreFolder, Quota, AuthKind, ImapSettings } from './src/mail/store.ts';
 export { dedupeKey, normalizeMessageId } from './src/mail/store.ts';
 export { ImapStore, type AccountAccess } from './src/mail/imap.ts';
 export { MemoryStore, makeMessage } from './src/mail/memory.ts';
