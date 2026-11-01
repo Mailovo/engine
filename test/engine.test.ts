@@ -5,6 +5,7 @@ import { MailovoError } from '../src/errors.ts';
 import { migrate, emptyState, gapsOf, MAX_FAILED_STREAK, totalsOf } from '../src/engine/migrate.ts';
 import { planFolders } from '../src/engine/plan.ts';
 import { MemoryStore, makeMessage } from '../src/mail/memory.ts';
+import type { MessageMeta } from '../src/mail/store.ts';
 
 function gmxLike() {
   const s = new MemoryStore('/');
@@ -212,6 +213,254 @@ test('Umzug: ein unlesbarer Ordner wird übersprungen und gemeldet, der Rest lä
   assert.equal(await migrate(src, dst, state, { includeTrash: false, includeJunk: false }), 'done');
   assert.equal(dst.folders.get('INBOX')!.messages.length, 1);
   assert.deepEqual(state.failedFolders, [{ folder: 'Rechnungen', code: 'INT-01' }]);
+});
+
+test('Umzug: ein Ordner, der erst beim nächsten Lauf lesbar ist, gilt danach nicht mehr als Lücke', async () => {
+  const src = gmxLike();
+  src.add('INBOX', makeMessage({ id: 'a@x' }));
+  src.add('Rechnungen', makeMessage({ id: 'r@x' }));
+  const originalWithFolder = src.withFolder.bind(src);
+  let broken = true;
+  src.withFolder = (path, fn) => (broken && path === 'Rechnungen' ? Promise.reject(new MailovoError('INT-01', { detail: 'BAD' })) : originalWithFolder(path, fn));
+  const dst = gmailLike();
+  const state = emptyState();
+  const opts = { includeTrash: false, includeJunk: false };
+  await migrate(src, dst, state, opts);
+  assert.deepEqual(gapsOf(state).folders, ['Rechnungen']);
+  broken = false;
+  await migrate(src, dst, state, opts);
+  assert.equal(dst.folders.get('Rechnungen')!.messages.length, 1);
+  assert.deepEqual(gapsOf(state).folders, []);
+});
+
+test('Nachsendung: im neuen Postfach wird nur ab dem Datum der neuen Mails abgeglichen, nicht der ganze Ordner', async () => {
+  const src = gmxLike();
+  src.add('INBOX', makeMessage({ id: 'alt@x' }), [], new Date('2025-01-01T10:00:00Z'));
+  const dst = gmailLike();
+  const state = emptyState();
+  const opts = { includeTrash: false, includeJunk: false, recentFirst: false };
+  assert.equal(await migrate(src, dst, state, opts), 'done');
+  src.add('INBOX', makeMessage({ id: 'neu@x' }), [], new Date('2026-10-30T10:00:00Z'));
+  const asked: (string | undefined)[] = [];
+  const originalWithFolder = dst.withFolder.bind(dst);
+  dst.withFolder = (path, fn) =>
+    originalWithFolder(path, (f) => fn({ ...f, dedupeKeys: (o) => (asked.push(o?.since?.toISOString()), f.dedupeKeys(o)) }));
+  assert.equal(await migrate(src, dst, state, opts), 'done');
+  assert.deepEqual(asked, ['2026-10-28T10:00:00.000Z']);
+  assert.equal(dst.folders.get('INBOX')!.messages.length, 2);
+  // Schon vorhanden und neu: der eingeschränkte Abgleich erkennt die Kopie trotzdem
+  src.add('INBOX', makeMessage({ id: 'neu@x' }), [], new Date('2026-10-30T10:00:00Z'));
+  assert.equal(await migrate(src, dst, state, opts), 'done');
+  assert.equal(dst.folders.get('INBOX')!.messages.length, 2);
+});
+
+test('Vorab laden: gleiches Ergebnis wie der Reihe nach (Doppelte, gelöschte, unlesbare Mails, Aktuelles zuerst, Pause)', async () => {
+  const DAY = 86400e3;
+  const run = async (prefetch: boolean) => {
+    const src = gmxLike();
+    for (let i = 1; i <= 40; i++) {
+      // Die letzten fünf sind aktuell ("Aktuelles zuerst"), jede zehnte trägt dieselbe Message-ID
+      const date = i > 35 ? new Date(Date.now() - (41 - i) * DAY) : new Date(Date.UTC(2025, 0, i));
+      src.add('INBOX', makeMessage({ id: i % 10 === 0 ? 'doppelt@x' : `m${i}@x`, subject: `Mail ${i}` }), i % 3 ? [] : ['\\Seen'], date);
+    }
+    src.add('Rechnungen', makeMessage({ id: 'r@x', subject: 'Rechnung' }));
+    const dst = gmailLike();
+    dst.add('INBOX', makeMessage({ id: 'm5@x', subject: 'Mail 5' }), [], new Date(Date.UTC(2025, 0, 5)));
+    const events: string[] = [];
+    src.beforeDownload = (path, uid) => {
+      events.push(`d${uid}`);
+      if (path === 'INBOX' && uid === 7) throw new MailovoError('INT-01', { detail: 'kaputt' });
+    };
+    dst.beforeAppend = (_path, content) => {
+      const nr = /Subject: Mail (\d+)/.exec(content.toString())?.[1] ?? '-';
+      events.push(`a${nr}`);
+      // Kundin löscht Mail 23 im alten Postfach, während Mail 15 abgelegt wird (nach der Pause, vor dem Vorab-Laden)
+      if (nr === '15') src.folders.get('INBOX')!.messages = src.folders.get('INBOX')!.messages.filter((m) => m.uid !== 23);
+    };
+    const state = emptyState();
+    const opts = { includeTrash: false, includeJunk: false, prefetch, retryDelayMs: 0 };
+    let n = 0;
+    assert.equal(await migrate(src, dst, state, opts, { onProgress: () => void n++, shouldStop: () => n >= 15 }), 'stopped');
+    assert.equal(await migrate(src, dst, state, opts), 'done');
+    const inbox = dst.folders.get('INBOX')!.messages.map((m) => `${/Subject: (.*)/.exec(m.content.toString())![1]}|${m.flags.join(',')}`);
+    return { result: { totals: totalsOf(state), unreadable: state.unreadable, folders: state.folders, inbox }, events };
+  };
+  const fast = await run(true);
+  const slow = await run(false);
+  assert.deepEqual(fast.result, slow.result);
+  // Die Sonderfälle kamen wirklich vor
+  assert.deepEqual([slow.result.totals.vanished, slow.result.totals.failed, slow.result.totals.duplicates >= 1], [1, 1, true]);
+  // Und es wird tatsächlich vorab geladen: Mail 2 kommt, bevor Mail 1 abgelegt ist
+  assert.ok(fast.events.indexOf('d2') < fast.events.indexOf('a1'), fast.events.join(' '));
+  assert.ok(slow.events.indexOf('d2') > slow.events.indexOf('a1'), slow.events.join(' '));
+});
+
+/** Weitere "Verbindung" ins selbe Postfach, die unterschiedlich lange braucht (zählt, wie viele gleichzeitig ablegen) */
+function slowWriter(dst: MemoryStore, load: { now: number; most: number }) {
+  return {
+    async append(path: string, content: Buffer, flags: string[], date?: Date) {
+      load.most = Math.max(load.most, ++load.now);
+      try {
+        await new Promise((r) => setTimeout(r, Math.random() * 4));
+        await dst.append(path, content, flags, date);
+      } finally {
+        load.now--;
+      }
+    },
+  };
+}
+
+test('Paralleles Ablegen: gleiches Ergebnis wie eine Mail nach der anderen (Fehler, zu groß, gelöscht, Doppelte, Pause)', async () => {
+  const DAY = 86400e3;
+  const run = async (writers: number) => {
+    const src = gmxLike();
+    for (let i = 1; i <= 60; i++) {
+      // Die letzten fünf sind aktuell ("Aktuelles zuerst"), jede zehnte ist dieselbe Mail noch einmal
+      const date = i > 55 ? new Date(Date.now() - (61 - i) * DAY) : new Date(Date.UTC(2025, 0, (i % 28) + 1));
+      const content = i % 10 === 0 ? makeMessage({ id: 'doppelt@x', subject: 'Doppelt' }) : makeMessage({ id: `m${i}@x`, subject: `Mail ${i}`, bytes: i === 33 ? 5000 : undefined });
+      src.add('INBOX', content, i % 3 ? [] : ['\\Seen'], date);
+    }
+    src.add('Rechnungen', makeMessage({ id: 'r@x', subject: 'Rechnung' }));
+    const dst = gmailLike();
+    dst.maxMessageBytes = 4000;
+    dst.add('INBOX', makeMessage({ id: 'm5@x', subject: 'Mail 5' }), [], new Date(Date.UTC(2025, 0, 6)));
+    src.beforeDownload = (path, uid) => {
+      if (path === 'INBOX' && uid === 7) throw new MailovoError('INT-01', { detail: 'kaputt' });
+    };
+    dst.beforeAppend = (_path, content) => {
+      const nr = /Subject: Mail (\d+)/.exec(content.toString())?.[1];
+      // Kundin löscht Mail 48, während Mail 44 abgelegt wird; Mail 41 lehnt das neue Postfach ab
+      if (nr === '44') src.folders.get('INBOX')!.messages = src.folders.get('INBOX')!.messages.filter((m) => m.uid !== 48);
+      if (nr === '41') throw new MailovoError('INT-01', { detail: 'abgelehnt' });
+    };
+    const load = { now: 0, most: 0 };
+    const opts = { includeTrash: false, includeJunk: false, retryDelayMs: 0, appendPool: Array.from({ length: writers - 1 }, () => slowWriter(dst, load)) };
+    const state = emptyState();
+    let n = 0;
+    assert.equal(await migrate(src, dst, state, opts, { onProgress: () => void n++, shouldStop: () => n >= 20 }), 'stopped');
+    assert.equal(await migrate(src, dst, state, opts), 'done');
+    // Im neuen Postfach kann die Reihenfolge abweichen (gleichzeitig abgelegt), der Inhalt nicht
+    const inbox = dst.folders.get('INBOX')!.messages.map((m) => `${/Subject: (.*)/.exec(m.content.toString())![1]}|${m.flags.join(',')}`).sort();
+    return { result: { totals: totalsOf(state), unreadable: state.unreadable, skipped: state.skipped, folders: state.folders, inbox }, most: load.most };
+  };
+  const parallel = await run(3);
+  const serial = await run(1);
+  assert.deepEqual(parallel.result, serial.result);
+  // Die Sonderfälle kamen wirklich vor, und es wurde wirklich gleichzeitig abgelegt
+  const t = serial.result.totals;
+  assert.deepEqual([t.vanished, t.failed, t.tooBig, t.duplicates >= 5], [1, 2, 1, true]);
+  assert.ok(parallel.most >= 2, `gleichzeitig: ${parallel.most}`);
+});
+
+test('Paralleles Ablegen: eine langsame Ablage hält die anderen Verbindungen nicht auf, verbucht wird trotzdem der Reihe nach', async () => {
+  const src = gmxLike();
+  for (let i = 1; i <= 20; i++) src.add('INBOX', makeMessage({ id: `m${i}@x`, subject: `Mail ${i}` }), [], new Date(Date.UTC(2025, 0, i)));
+  const dst = gmailLike();
+  const finished: string[] = [];
+  const writer = {
+    async append(path: string, content: Buffer, flags: string[], date?: Date) {
+      const nr = /Subject: Mail (\d+)/.exec(content.toString())![1]!;
+      // Mail 1 braucht lange (wie die Ausreißer bei iCloud)
+      await new Promise((r) => setTimeout(r, nr === '1' ? 150 : 1));
+      await dst.append(path, content, flags, date);
+      finished.push(nr);
+    },
+  };
+  const order: number[] = [];
+  const state = emptyState();
+  const opts = { includeTrash: false, includeJunk: false, recentFirst: false, appendPool: [writer, writer] };
+  assert.equal(await migrate(src, dst, state, opts, { onProgress: (s) => void order.push(s.folders.INBOX?.lastUid ?? 0) }), 'done');
+  assert.ok(finished.indexOf('1') >= 4, `während Mail 1 hing, kamen andere an: ${finished.join(' ')}`);
+  assert.deepEqual(order.filter((u, n) => u > 0 && u !== order[n - 1]), Array.from({ length: 20 }, (_, n) => n + 1), 'verbucht der Reihe nach');
+  assert.equal(dst.folders.get('INBOX')!.messages.length, 20);
+});
+
+test('Neues Postfach "ausgelastet": nur diese Mail wird nach einer Pause noch einmal geschickt, kein Abbruch, keine Dublette', async () => {
+  const busy = () => new MailovoError('NET-01', { retryable: true, detail: 'UNAVAILABLE | Server Busy. Please try again later. 110 NO [UNAVAILABLE] Server Busy.' });
+  for (const appendPool of [undefined, 'pool'] as const) {
+    const src = gmxLike();
+    for (let i = 1; i <= 12; i++) src.add('INBOX', makeMessage({ id: `m${i}@x`, subject: `Mail ${i}` }), [], new Date(Date.UTC(2025, 0, i)));
+    const dst = gmailLike();
+    let refusals = 2;
+    dst.beforeAppend = (_path, content) => {
+      if (refusals > 0 && /Subject: Mail 5\r/.test(content.toString())) {
+        refusals--;
+        throw busy();
+      }
+    };
+    const writer = { append: (path: string, c: Buffer, f: string[], d?: Date) => dst.append(path, c, f, d) };
+    const opts = { includeTrash: false, includeJunk: false, busyDelaysMs: [0, 0, 0], appendPool: appendPool ? [writer, writer, writer] : undefined };
+    const state = emptyState();
+    assert.equal(await migrate(src, dst, state, opts), 'done', String(appendPool));
+    const subjects = dst.folders.get('INBOX')!.messages.map((m) => /Subject: (.*)/.exec(m.content.toString())![1]);
+    assert.deepEqual([subjects.length, new Set(subjects).size, totalsOf(state).copied], [12, 12, 12]);
+  }
+  // Bleibt es ausgelastet, ist es eine Störung des Auftrags (wird später wiederholt); andere Netzfehler sofort
+  const src = gmxLike();
+  src.add('INBOX', makeMessage({ id: 'a@x', subject: 'Mail 1' }));
+  const dst = gmailLike();
+  dst.beforeAppend = () => {
+    throw busy();
+  };
+  await assert.rejects(migrate(src, dst, emptyState(), { includeTrash: false, includeJunk: false, busyDelaysMs: [0, 0, 0] }), (e: MailovoError) => e.code === 'NET-01');
+  let calls = 0;
+  dst.beforeAppend = () => {
+    calls++;
+    throw new MailovoError('NET-01', { retryable: true, detail: 'NoConnection | Connection not available' });
+  };
+  await assert.rejects(migrate(src, dst, emptyState(), { includeTrash: false, includeJunk: false, busyDelaysMs: [0, 0, 0] }), (e: MailovoError) => e.code === 'NET-01');
+  assert.equal(calls, 1, 'Verbindung weg: nicht blind noch einmal schicken (könnte schon angekommen sein)');
+});
+
+test('Paralleles Ablegen: Postfach voll mitten im Stapel, danach weiter ohne Verlust und ohne Doppelte', async () => {
+  const src = gmxLike();
+  for (let i = 1; i <= 30; i++) src.add('INBOX', makeMessage({ id: `m${i}@x`, subject: `Mail ${i}` }), [], new Date(Date.UTC(2025, 0, i % 28 || 1)));
+  const dst = gmailLike();
+  let full = true;
+  dst.beforeAppend = (_path, content) => {
+    if (full && /Subject: Mail 13\r/.test(content.toString())) {
+      full = false;
+      throw new MailovoError('CAP-02');
+    }
+  };
+  const load = { now: 0, most: 0 };
+  const opts = { includeTrash: false, includeJunk: false, appendPool: [slowWriter(dst, load), slowWriter(dst, load), slowWriter(dst, load)] };
+  const state = emptyState();
+  await assert.rejects(migrate(src, dst, state, opts), (e: MailovoError) => e.code === 'CAP-02');
+  assert.equal(await migrate(src, dst, state, opts), 'done');
+  const subjects = dst.folders.get('INBOX')!.messages.map((m) => /Subject: (.*)/.exec(m.content.toString())![1]);
+  assert.equal(subjects.length, 30);
+  assert.equal(new Set(subjects).size, 30, 'keine Mail doppelt');
+  const t = totalsOf(state);
+  assert.equal(t.copied + t.duplicates, 30);
+});
+
+test('Umzug: sehr großer Ordner (200 000 Mails) sprengt beim Zählen nicht den Aufrufstapel', async () => {
+  const src = gmxLike();
+  const big: MessageMeta[] = Array.from({ length: 200_000 }, (_, i) => ({ uid: i + 1, size: 1000, flags: [] }));
+  const originalWithFolder = src.withFolder.bind(src);
+  src.withFolder = (path, fn) =>
+    originalWithFolder(path, (f) => fn(path === 'INBOX' ? { ...f, messages: async (o = {}) => big.filter((m) => m.uid >= (o.minUid ?? 1)) } : f));
+  const state = emptyState();
+  assert.equal(await migrate(src, gmailLike(), state, { includeTrash: false, includeJunk: false }, { shouldStop: () => true }), 'stopped');
+  assert.equal(state.folders.INBOX!.total, 200_000);
+  assert.equal(state.folders.INBOX!.totalBytes, 200_000_000);
+  assert.equal(state.folders.INBOX!.maxUid, 200_000);
+});
+
+test('Umzug: von abgebrochenen Läufen aufgeblähter Zählstand wird beim Fortsetzen richtiggestellt', async () => {
+  const src = gmxLike();
+  src.add('INBOX', makeMessage({ id: 'a@x' }));
+  src.add('INBOX', makeMessage({ id: 'b@x' }));
+  const dst = gmailLike();
+  const state = emptyState();
+  // Stand nach vier abgestürzten Läufen: total viermal erhöht, maxUid nie gesetzt, nichts kopiert
+  state.folders.INBOX = { target: 'INBOX', total: 8, totalBytes: 800, lastUid: 0, maxUid: 0, copied: 0, duplicates: 0, tooBig: 0, bytes: 0, done: false };
+  assert.equal(await migrate(src, dst, state, { includeTrash: false, includeJunk: false }), 'done');
+  const t = totalsOf(state);
+  assert.equal(t.messages, 2);
+  assert.equal(t.processed, 2);
+  assert.equal(dst.folders.get('INBOX')!.messages.length, 2);
 });
 
 test('Umzug: Netzfehler bleiben Fehler des ganzen Auftrags (kein stilles Überspringen)', async () => {

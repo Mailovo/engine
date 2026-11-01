@@ -96,7 +96,8 @@ test('IMAP: Ordner werden nur lesend geöffnet (EXAMINE), geschrieben wird nur m
     assert.doesNotMatch(imap, new RegExp(`\\b${n}\\s*\\??\\.?\\[`), `${n}[…]: Methoden nur mit Namen aufrufen`);
     for (const m of imap.matchAll(new RegExp(`\\b${n}\\s*\\??\\.\\s*(\\w+)\\s*\\(`, 'g'))) calls.set(m[1]!, (calls.get(m[1]!) ?? 0) + 1);
   }
-  const READ = ['connect', 'on', 'list', 'getMailboxLock', 'search', 'fetch', 'fetchOne', 'getQuota', 'logout', 'close'];
+  // noop: hält wartende Verbindungen offen, ändert nichts
+  const READ = ['connect', 'on', 'list', 'getMailboxLock', 'search', 'fetch', 'fetchOne', 'getQuota', 'noop', 'logout', 'close'];
   const WRITE = ['append', 'mailboxCreate'];
   assert.ok(calls.has('fetch') && calls.has('getMailboxLock'), `Aufrufe über Aliase nicht erkannt: ${[...calls.keys()].join(', ')}`);
   const unknown = [...calls.keys()].filter((c) => !READ.includes(c) && !WRITE.includes(c));

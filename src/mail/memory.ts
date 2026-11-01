@@ -144,8 +144,8 @@ export class MemoryStore implements MailStore {
             internalDate: m.date,
           }));
       },
-      async dedupeKeys() {
-        const keys = f.messages.map((m) =>
+      async dedupeKeys(opts = {}) {
+        const keys = f.messages.filter((m) => !opts.since || (m.date ?? new Date(0)) >= opts.since).map((m) =>
           dedupeKey({
             messageId: normalizeMessageId(header(m.content, 'Message-ID')),
             from: /<([^>]+)>|(\S+@\S+)/.exec(header(m.content, 'From') ?? '')?.slice(1).find(Boolean),

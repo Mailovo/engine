@@ -53,8 +53,8 @@ export interface Quota {
 export interface FolderHandle {
   /** Metadaten aller Nachrichten ab minUid, optional nur ab einem Datum; aufsteigend nach UID. */
   messages(opts?: { since?: Date; minUid?: number }): Promise<MessageMeta[]>;
-  /** Duplikat-Schlüssel aller Mails im Ordner (Message-ID, sonst Fingerabdruck). */
-  dedupeKeys(): Promise<Set<string>>;
+  /** Duplikat-Schlüssel aller Mails im Ordner (Message-ID, sonst Fingerabdruck), optional nur ab einem Eingangsdatum. */
+  dedupeKeys(opts?: { since?: Date }): Promise<Set<string>>;
   /** UIDVALIDITY des Ordners; ändert sie sich, sind alte UIDs ungültig. */
   uidValidity(): string | undefined;
   /** Vollständige Nachricht (RFC 822); wird unverändert ins neue Postfach übertragen, nie ausgewertet. */

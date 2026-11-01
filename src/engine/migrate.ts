@@ -54,7 +54,20 @@ export interface MigrationState {
    * messages/bytes = was wegen der Grenze fehlt.
    */
   cap?: { last: CapKey | null; messages: number; bytes: number };
+  /**
+   * Erste Mail einer Serie von Fehlschlägen, wegen der der Auftrag abgebrochen wurde, und wie oft schon. Scheitert
+   * dieselbe Serie in mehreren Läufen (frische Verbindungen, Stunden auseinander), liegt es an den Mails, nicht am
+   * Server: dann werden sie als nicht übertragbar verbucht und der Rest läuft weiter, statt dass alles scheitert.
+   */
+  suspect?: { folder: string; uid: number; seen: number };
 }
+
+/** Eine bearbeitete Mail auf dem Weg zum Verbuchen (siehe copyList) */
+type AppendStep = { meta: MessageMeta; kind: 'append'; key?: string; content: Buffer; result?: { ok: true } | { ok: false; error: unknown } };
+type Step =
+  | { meta: MessageMeta; kind: 'skip' | 'duplicate' | 'vanished' }
+  | { meta: MessageMeta; kind: 'unreadable'; err: MailovoError }
+  | AppendStep;
 
 /** "Aktuelles zuerst": Mails dieser letzten Tage kommen vor allen älteren an, damit das neue Postfach sofort nutzbar ist */
 export const RECENT_DAYS = 30;
@@ -72,6 +85,30 @@ export interface MigrationOptions extends PlanOptions {
   observe?: Observer;
   /** Pause vor dem zweiten Leseversuch einer Mail (Tests: 0) */
   retryDelayMs?: number;
+  /**
+   * Die nächste Mail schon aus dem alten Postfach laden, während die aktuelle im neuen abgelegt wird (beide Verbindungen
+   * arbeiten gleichzeitig). Verbucht wird weiter streng der Reihe nach. Standard aus.
+   */
+  prefetch?: boolean;
+  /**
+   * Verbindungen zum neuen Postfach nur zum Ablegen: Über alle zusammen werden so viele Mails gleichzeitig abgelegt
+   * (manche Anbieter, z. B. iCloud, brauchen pro Mail über eine Sekunde). Ohne: über target, eine nach der anderen.
+   * Verbucht wird immer streng der Reihe nach.
+   */
+  appendPool?: Pick<MailStore, 'append'>[];
+  /** Pausen, wenn das neue Postfach "ausgelastet" meldet, bevor dieselbe Mail noch einmal abgelegt wird (Tests: [0]) */
+  busyDelaysMs?: number[];
+}
+
+/** Standard: dreimal warten (15 s, 45 s, 2 Min.), erst dann gilt es als Störung des ganzen Auftrags */
+const BUSY_DELAYS_MS = [15_000, 45_000, 120_000];
+
+/**
+ * Das neue Postfach lehnt eine Mail ab, weil es gerade ausgelastet ist (iCloud: "NO [UNAVAILABLE] Server Busy. Please
+ * try again later"). Die Mail wurde dann sicher nicht abgelegt und darf ohne Dublette noch einmal geschickt werden.
+ */
+function isBusy(err: unknown): boolean {
+  return err instanceof MailovoError && err.code === 'NET-01' && /UNAVAILABLE|server busy|try again later/i.test(err.detail ?? '');
 }
 
 /**
@@ -93,6 +130,8 @@ export interface MigrationHooks {
   /** true = anhalten (Pause/Abbruch durch Nutzer) */
   shouldStop?(): boolean;
   now?(): Date;
+  /** Dauer einer Netzwerkaktion in ms (Auswertung des Tempos); writer = Nummer der Verbindung beim Ablegen */
+  timing?(kind: 'download' | 'append', ms: number, writer?: number): void;
 }
 
 export function emptyState(): MigrationState {
@@ -134,6 +173,14 @@ const CHECKPOINT_EVERY = 20;
  * gestört, Verbindung kaputt). Dann wird nichts übersprungen, sondern der ganze Auftrag später wiederholt.
  */
 export const MAX_FAILED_STREAK = 5;
+/** So viele Läufe muss dieselbe Serie gescheitert sein, bevor sie als Einzelfälle gilt (siehe MigrationState.suspect) */
+export const SUSPECT_RUNS = 2;
+/**
+ * So viele Mails nacheinander, die es im alten Postfach angeblich nicht mehr gibt, sind eher eine gestörte Verbindung
+ * als eine Aufräumaktion der Kundin. Dann wird nichts als gelöscht verbucht, sondern der Auftrag später wiederholt;
+ * fehlen die Mails dann wirklich, stehen sie in der neuen Liste gar nicht mehr.
+ */
+export const MAX_VANISHED_STREAK = 50;
 
 /** Ausgehende und aussortierte Ordner sagen nichts darüber, wo die Adresse hinterlegt ist. */
 const NOT_INBOUND = new Set(['sent', 'drafts', 'trash', 'junk']);
@@ -220,9 +267,16 @@ export async function migrate(
     if (uv) fs.uidValidity = uv;
     // Nur Mails zählen, die noch nicht in total stecken (neu eingetroffen oder erster Lauf)
     const fresh = list.filter((m) => m.uid > (fs.maxUid ?? fs.lastUid));
+    // Noch keine UID gezählt und nichts erledigt: neu zählen statt addieren. Heilt Stände, in denen ein abgebrochener
+    // Lauf total schon erhöht hatte, maxUid aber nicht mehr (so geschehen beim Absturz mit sehr großen Ordnern)
+    if (!fs.maxUid && fs.copied + fs.duplicates + fs.tooBig + (fs.vanished ?? 0) + (fs.failed ?? 0) === 0) {
+      fs.total = 0;
+      fs.totalBytes = 0;
+    }
     fs.total += fresh.length;
     fs.totalBytes += fresh.reduce((n, m) => n + m.size, 0);
-    if (fresh.length) fs.maxUid = Math.max(fs.maxUid ?? 0, ...fresh.map((m) => m.uid));
+    // Nicht Math.max(...uids): ab etwa 120 000 Mails in einem Ordner sprengt das den Aufrufstapel ("Maximum call stack size exceeded")
+    if (fresh.length) fs.maxUid = fresh.reduce((max, m) => (m.uid > max ? m.uid : max), fs.maxUid ?? 0);
     fs.done = list.length === 0;
     if (isSync) state.synced = (state.synced ?? 0) + fresh.length;
 
@@ -232,14 +286,30 @@ export async function migrate(
   await hooks.onPlan?.(plan, { messages: t.messages, bytes: t.bytes });
   await hooks.checkpoint?.(state);
 
+  /**
+   * Nachsendung: im neuen Postfach nur Mails abgleichen, die so alt sein können wie die neuen (2 Tage Puffer für Zeitzonen).
+   * Kopien tragen das Eingangsdatum des Originals; sonst läse jeder Lauf alle 30 Minuten den ganzen Posteingang.
+   */
+  function dedupeSince(list: MessageMeta[]): Date | undefined {
+    if (!isSync || !list.length) return undefined;
+    let oldest = Infinity;
+    for (const m of list) {
+      const t = m.internalDate?.getTime();
+      if (t === undefined || Number.isNaN(t)) return undefined;
+      if (t < oldest) oldest = t;
+    }
+    return new Date(oldest - 2 * DAY);
+  }
+
   // Zielordner vorbereiten und vorhandene Mails für den Duplikat-Abgleich lesen; null = Ordner nicht nutzbar
-  async function prepare(p: FolderPlan, fs: FolderState): Promise<Set<string> | null> {
+  async function prepare(p: FolderPlan, fs: FolderState, list: MessageMeta[] = []): Promise<Set<string> | null> {
     try {
       if (p.create && !fs.created) {
         await target.createFolder(fs.target);
         fs.created = true;
       }
-      return await target.withFolder(fs.target, (f) => f.dedupeKeys());
+      const since = dedupeSince(list);
+      return await target.withFolder(fs.target, (f) => f.dedupeKeys(since ? { since } : undefined));
     } catch (err) {
       if (!isFolderLevel(err)) throw err;
       markFailed(state, p.source, err);
@@ -266,6 +336,8 @@ export async function migrate(
     const copied = copiedNow.get(fs.target)!;
     /** Fehlschläge seit dem letzten Erfolg; festgehalten erst, wenn danach wieder etwas klappt oder der Ordner endet */
     let pending: { meta: MessageMeta; code: string }[] = [];
+    /** Im alten Postfach nicht mehr gefundene Mails seit dem letzten Erfolg; verbucht wie pending */
+    let vanishing: MessageMeta[] = [];
     const commit = () => {
       if (!early) {
         for (const { meta, code } of pending) {
@@ -274,7 +346,13 @@ export async function migrate(
           fs.lastUid = Math.max(fs.lastUid, meta.uid);
         }
       }
+      for (const meta of vanishing) {
+        fs.vanished = (fs.vanished ?? 0) + 1;
+        if (early) (fs.early ??= []).push(meta.uid);
+        else fs.lastUid = Math.max(fs.lastUid, meta.uid);
+      }
       pending = [];
+      vanishing = [];
     };
     /** Etwas hat geklappt: vorherige Fehlschläge waren Einzelfälle */
     const ok = () => {
@@ -283,80 +361,208 @@ export async function migrate(
     };
     const fail = (meta: MessageMeta, err: MailovoError) => {
       pending.push({ meta, code: err.code });
+      if (++streak < MAX_FAILED_STREAK) return;
+      // Kennzeichen der Serie: kleinste UID (gleich, ob "Aktuelles zuerst" sie rückwärts oder später vorwärts trifft)
+      const first = pending.reduce((min, f) => Math.min(min, f.meta.uid), Infinity);
+      const same = state.suspect?.folder === p.source && state.suspect.uid === first;
+      if (same && state.suspect!.seen >= SUSPECT_RUNS) {
+        // Dieselbe Serie schon in mehreren Läufen: es liegt an diesen Mails. Verbuchen (bei "Aktuelles zuerst" erst im
+        // zweiten Durchgang, dann stehen sie im Bericht) und weitermachen
+        commit();
+        streak = 0;
+        if (!early) state.suspect = undefined;
+        return;
+      }
       // Grundsätzliches Problem: nichts festhalten, der Auftrag beginnt später wieder vor diesen Mails
-      if (++streak >= MAX_FAILED_STREAK) throw err;
+      state.suspect = { folder: p.source, uid: first, seen: same ? state.suspect!.seen + 1 : 1 };
+      throw err;
     };
+    /**
+     * Verbindungen zum Ablegen. Die eigenen haben keinen Ordner geöffnet: Auf target ist der Zielordner (für den Abgleich)
+     * geöffnet, dann hängt imapflow an jedes APPEND noch NOOP und SEARCH an (z. B. bei iCloud ohne UIDPLUS).
+     */
+    const writers: Pick<MailStore, 'append'>[] = opts.appendPool?.length ? opts.appendPool : [target];
     await source.withFolder(p.source, async (folder) => {
-      for (const meta of list) {
-        if (hooks.shouldStop?.()) return;
-        if (!skip.has(meta.uid)) {
-          enforceLimits(state, meta.size, opts, now());
-          const key = dedupeKey(meta);
-          const seen = key ? copied.get(key) : undefined;
-          if (key && (seen ? seen.has(meta.size) : existing.has(key))) {
-            fs.duplicates++;
-          } else {
-            let content: Buffer | undefined;
-            let failed = false;
-            for (let attempt = 1; !content && !failed; attempt++) {
-              try {
-                content = await folder.download(meta.uid);
-              } catch (err) {
-                // Inzwischen im alten Postfach gelöscht: überspringen statt den ganzen Umzug abzubrechen
-                if (err instanceof MailovoError && err.code === 'DATA-04') break;
-                if (!isFolderLevel(err)) throw err;
-                // Lesen ändert nichts: einmal kurz warten und noch einmal versuchen
-                if (attempt < 2) await pause(opts.retryDelayMs ?? 1500);
-                else {
-                  fail(meta, err);
-                  failed = true;
-                }
-              }
-            }
-            if (failed) continue;
-            if (!content) {
-              ok();
-              fs.vanished = (fs.vanished ?? 0) + 1;
-              if (early) (fs.early ??= []).push(meta.uid);
-              if (!early) fs.lastUid = meta.uid;
-              await hooks.onProgress?.(state);
-              continue;
-            }
-            countWindow(state, 'downloaded', content.length, now());
-            try {
-              await target.append(fs.target, content, meta.flags, meta.internalDate);
-              countWindow(state, 'uploaded', content.length, now());
-              fs.copied++;
-              fs.bytes += content.length;
-              if (key) {
-                existing.add(key);
-                if (!copied.has(key)) copied.set(key, new Set());
-                copied.get(key)!.add(meta.size);
-              }
-            } catch (err) {
-              if (err instanceof MailovoError && err.code === 'DATA-02') {
-                fs.tooBig++;
-                state.skipped.push({ folder: p.source, subject: meta.subject, size: meta.size, date: meta.internalDate?.toISOString() });
-              } else {
-                // Vom neuen Postfach abgelehnt (z. B. beschädigte Kopfzeilen); nicht sofort wiederholen, sonst droht eine Dublette
-                if (!isFolderLevel(err)) throw err;
-                fail(meta, err);
-                continue;
-              }
-            }
+      /** Schon angestoßener Download der nächsten Mail (opts.prefetch); Fehler zeigen sich erst, wenn sie an der Reihe ist */
+      let ahead: { uid: number; content: Promise<Buffer> } | undefined;
+      const isDuplicate = (m: MessageMeta, key = dedupeKey(m)) => {
+        const seen = key ? copied.get(key) : undefined;
+        return !!key && (seen ? seen.has(m.size) : existing.has(key));
+      };
+      const download = (uid: number, attempt: number) => {
+        const loaded = attempt === 1 && ahead?.uid === uid ? ahead.content : undefined;
+        if (loaded) ahead = undefined;
+        return loaded ?? folder.download(uid);
+      };
+      const loadAhead = (next: MessageMeta | undefined) => {
+        if (!opts.prefetch || !next || skip.has(next.uid) || isDuplicate(next)) return;
+        const content = folder.download(next.uid);
+        content.catch(() => {});
+        ahead = { uid: next.uid, content };
+      };
+
+      /**
+       * Bearbeitete, noch nicht verbuchte Mails in Listenreihenfolge. Jede freie Verbindung legt sofort die nächste Mail
+       * ab; verbucht wird immer vom Anfang her, sobald dort ein Ergebnis vorliegt (streng der Reihe nach, genau wie beim
+       * Kopieren einer Mail nach der anderen). So bremst eine langsame Ablage nicht alle anderen Verbindungen.
+       */
+      const queue: Step[] = [];
+      /** Freie Verbindungen (Index in writers) und laufende Ablagen */
+      const free = writers.map((_, n) => n).reverse();
+      const running = new Set<Promise<void>>();
+      /** Höchstens so viel Abgelegtes wartet aufs Verbuchen (eine hängende Ablage soll nicht den Speicher füllen) */
+      const MAX_AHEAD = writers.length * 4;
+      const MAX_AHEAD_BYTES = 64 * 1024 * 1024;
+      const waiting = () => queue.filter((s): s is AppendStep => s.kind === 'append');
+
+      const apply = async (s: Step) => {
+        const { meta } = s;
+        if (s.kind === 'unreadable') return fail(meta, s.err);
+        if (s.kind === 'vanished') {
+          vanishing.push(meta);
+          if (vanishing.length >= MAX_VANISHED_STREAK) {
+            throw new MailovoError('NET-01', { retryable: true, detail: `${vanishing.length} Mails nacheinander nicht im alten Postfach gefunden (${p.source})` });
           }
+          await hooks.onProgress?.(state);
+          return;
+        }
+        if (s.kind === 'duplicate') fs.duplicates++;
+        if (s.kind === 'append') {
+          const r = s.result!;
+          if (r.ok) {
+            countWindow(state, 'uploaded', s.content.length, now());
+            fs.copied++;
+            fs.bytes += s.content.length;
+            if (s.key) {
+              existing.add(s.key);
+              if (!copied.has(s.key)) copied.set(s.key, new Set());
+              copied.get(s.key)!.add(meta.size);
+            }
+          } else if (r.error instanceof MailovoError && r.error.code === 'DATA-02') {
+            fs.tooBig++;
+            state.skipped.push({ folder: p.source, subject: meta.subject, size: meta.size, date: meta.internalDate?.toISOString() });
+          } else {
+            // Vom neuen Postfach abgelehnt (z. B. beschädigte Kopfzeilen); nicht sofort wiederholen, sonst droht eine Dublette
+            if (!isFolderLevel(r.error)) throw r.error;
+            return fail(meta, r.error);
+          }
+        }
+        if (s.kind !== 'skip') {
           ok();
           if (early) (fs.early ??= []).push(meta.uid);
         }
-        if (!early && !pending.length) fs.lastUid = meta.uid;
+        if (!early && !pending.length && !vanishing.length) fs.lastUid = meta.uid;
         await hooks.onProgress?.(state);
         if (++sinceCheckpoint >= CHECKPOINT_EVERY) {
           sinceCheckpoint = 0;
           await hooks.checkpoint?.(state);
         }
+      };
+
+      /** Vom Anfang her verbuchen, was fertig ist */
+      const settle = async () => {
+        while (queue.length && (queue[0]!.kind !== 'append' || queue[0]!.result)) await apply(queue.shift()!);
+      };
+      /** Auf die nächste fertige Ablage warten, dann verbuchen */
+      const waitOne = async () => {
+        if (running.size) await Promise.race(running);
+        await settle();
+      };
+      /** Alles Begonnene ablegen und verbuchen */
+      const drain = async () => {
+        while (queue.length) {
+          if (!running.size && queue[0]!.kind === 'append' && !queue[0]!.result) throw new Error('Ablage ohne Verbindung');
+          await waitOne();
+        }
+      };
+      const dispatch = (s: AppendStep) => {
+        const n = free.pop()!;
+        const started = Date.now();
+        const delays = opts.busyDelaysMs ?? BUSY_DELAYS_MS;
+        // Ausgelastet: nur diese Verbindung wartet und schickt dieselbe Mail noch einmal, die anderen arbeiten weiter
+        const send = async (): Promise<void> => {
+          for (let tries = 0; ; tries++) {
+            try {
+              return await writers[n]!.append(fs.target, s.content, s.meta.flags, s.meta.internalDate);
+            } catch (err) {
+              if (tries >= delays.length || !isBusy(err)) throw err;
+              await pause(delays[tries]!);
+            }
+          }
+        };
+        const task: Promise<void> = send()
+          .then(
+            () => void (s.result = { ok: true }),
+            (error: unknown) => void (s.result = { ok: false, error }),
+          )
+          .finally(() => {
+            hooks.timing?.('append', Date.now() - started, n);
+            free.push(n);
+            running.delete(task);
+          });
+        running.add(task);
+      };
+
+      try {
+        for (let i = 0; i < list.length; i++) {
+          const meta = list[i]!;
+          if (hooks.shouldStop?.()) {
+            // Schon Geladenes noch ablegen und verbuchen, dann anhalten
+            await drain();
+            return;
+          }
+          let step: Step;
+          if (skip.has(meta.uid)) step = { meta, kind: 'skip' };
+          else {
+            enforceLimits(state, meta.size, opts, now());
+            const key = dedupeKey(meta);
+            // Dieselbe Message-ID wird gerade abgelegt: erst deren Ergebnis verbuchen, dann entscheiden
+            while (key && waiting().some((s) => s.key === key)) await waitOne();
+            if (isDuplicate(meta, key)) step = { meta, kind: 'duplicate' };
+            else {
+              let content: Buffer | undefined;
+              let error: MailovoError | undefined;
+              for (let attempt = 1; !content && !error; attempt++) {
+                try {
+                  const started = Date.now();
+                  content = await download(meta.uid, attempt);
+                  hooks.timing?.('download', Date.now() - started);
+                } catch (err) {
+                  // Inzwischen im alten Postfach gelöscht: überspringen statt den ganzen Umzug abzubrechen
+                  if (err instanceof MailovoError && err.code === 'DATA-04') break;
+                  if (!isFolderLevel(err)) throw err;
+                  // Lesen ändert nichts: einmal kurz warten und noch einmal versuchen
+                  if (attempt < 2) await pause(opts.retryDelayMs ?? 1500);
+                  else error = err;
+                }
+              }
+              if (error) step = { meta, kind: 'unreadable', err: error };
+              else if (!content) step = { meta, kind: 'vanished' };
+              else {
+                countWindow(state, 'downloaded', content.length, now());
+                step = { meta, kind: 'append', key, content };
+              }
+            }
+          }
+          if (step.kind === 'append') {
+            // Eine Verbindung muss frei sein, und es darf nicht zu viel Abgelegtes aufs Verbuchen warten
+            while (!free.length || waiting().length >= MAX_AHEAD || waiting().reduce((n, s) => n + s.content.length, 0) >= MAX_AHEAD_BYTES) await waitOne();
+            // Eine Verbindung: eine Mail nach der anderen wie bisher, die nächste höchstens schon laden, während diese abgelegt wird
+            if (writers.length === 1) loadAhead(list[i + 1]);
+            dispatch(step);
+            queue.push(step);
+            if (writers.length === 1) await drain();
+          } else queue.push(step);
+          await settle();
+        }
+        await drain();
+        // Ordnerende: Fehlschläge und gelöschte Mails festhalten (der Zähler läuft weiter, ein grundsätzliches Problem zeigt sich auch über Ordner hinweg)
+        commit();
+      } finally {
+        // Laufende Ablagen und den Vorab-Download abwarten, bevor der Ordner freigegeben wird (sonst liefe er im nächsten Ordner)
+        await Promise.allSettled([...running]);
+        if (ahead) await ahead.content.catch(() => {});
       }
-      // Ordnerende: Fehlschläge festhalten (der Zähler läuft weiter, ein grundsätzliches Problem zeigt sich auch über Ordner hinweg)
-      commit();
     });
   }
 
@@ -387,15 +593,18 @@ export async function migrate(
   for (const p of readable) {
     const fs = state.folders[p.source]!;
     if (fs.done) continue;
-    const existing = await prepare(p, fs);
+    const list = metas.get(p.source) ?? [];
+    const existing = await prepare(p, fs, list);
     if (!existing) continue;
-    await copyList(p, fs, existing, metas.get(p.source) ?? [], false);
+    await copyList(p, fs, existing, list, false);
     if (hooks.shouldStop?.()) {
       await hooks.checkpoint?.(state);
       return 'stopped';
     }
     fs.done = true;
     fs.early = undefined;
+    // Früher nicht lesbarer Ordner ist jetzt vollständig: nicht mehr als Lücke melden
+    if (state.failedFolders?.some((f) => f.folder === p.source)) state.failedFolders = state.failedFolders.filter((f) => f.folder !== p.source);
     await hooks.checkpoint?.(state);
   }
   state.runs = (state.runs ?? 0) + 1;

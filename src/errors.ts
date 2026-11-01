@@ -71,9 +71,12 @@ const TLS_CODES = new Set([
   'ERR_SSL_WRONG_VERSION_NUMBER',
   'EPROTO',
 ]);
-const NOT_FOUND_CODES = new Set(['ENOTFOUND', 'EAI_AGAIN', 'EAI_NONAME']);
+const NOT_FOUND_CODES = new Set(['ENOTFOUND', 'EAI_NONAME']);
 const REFUSED_CODES = new Set(['ECONNREFUSED', 'EHOSTUNREACH', 'ENETUNREACH']);
-const NET_CODES = new Set(['ETIMEOUT', 'ETIMEDOUT', 'ECONNRESET', 'EPIPE', 'NoConnection', 'ESOCKET', 'ECONNABORTED']);
+// EAI_AGAIN: Namensauflösung vorübergehend gestört (oft bei uns), kein falscher Servername
+const NET_CODES = new Set(['ETIMEOUT', 'ETIMEDOUT', 'ECONNRESET', 'EPIPE', 'NoConnection', 'ESOCKET', 'ECONNABORTED', 'EAI_AGAIN', 'GREETING_TIMEOUT', 'UPGRADE_TIMEOUT', 'LockTimeout', 'StateLogout']);
+/** Server meldet sich vorübergehend nicht bereit (z. B. iCloud "[UNAVAILABLE] … try again later") */
+const TRANSIENT = /\[UNAVAILABLE\]|try again later|temporar(il)?y (unavailable|failure)|server (is )?(busy|unavailable)/i;
 
 /** Ordnet einen Fehler aus imapflow/Node einem Katalog-Code zu. */
 export function classify(err: unknown, ctx: ClassifyContext): MailovoError {
@@ -124,13 +127,14 @@ export function classify(err: unknown, ctx: ClassifyContext): MailovoError {
   // Mail wurde im alten Postfach gelöscht, während wir kopiert haben
   if (e.code === 'EMISSING') return make('DATA-04');
 
-  // Ordner anlegen
-  if (ctx.stage === 'create') return make('DATA-01');
-
-  // Netzwerk
-  if ((e.code && NET_CODES.has(e.code)) || /timed? ?out|socket|connection (closed|reset|lost)|unexpected close/i.test(text)) {
+  // Netzwerk und vorübergehende Störungen: vor den Einordnungen je Schritt, sonst würde z. B. ein Verbindungsabbruch
+  // beim Ordner-Anlegen zu "Ordner konnte nicht angelegt werden" und der Ordner übersprungen
+  if ((e.code && NET_CODES.has(e.code)) || e.serverResponseCode === 'UNAVAILABLE' || TRANSIENT.test(text) || /timed? ?out|socket|connection (closed|reset|lost)|unexpected close/i.test(text)) {
     return make('NET-01', { retryable: true });
   }
+
+  // Ordner anlegen
+  if (ctx.stage === 'create') return make('DATA-01');
 
   return make('INT-01');
 }
